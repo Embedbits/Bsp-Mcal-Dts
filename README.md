@@ -13,7 +13,10 @@ This README is the landing page and the **specification of the interface** (mast
 own README with everything that is specific to the family: the instances of the device, their settings and the status of
 the implementation.
 
-> **Status: design.** No implementation exists yet, the interface below is a proposal. Stories and branches follow.
+> **Status: implemented for STM32H5** (branch `Dev/STM32H5`). Unit tests run on all 12 STM32H5
+> lines (host, Unity + CMock + RegMem). Integration tests are compiled for the target but were
+> not run on hardware by this agent (no board access). See the STM32H5 row of the families
+> table below for the exact scope and the deviations from this specification.
 
 ---
 
@@ -28,7 +31,7 @@ the implementation.
   (the frequency at the reference temperature and the ramp coefficient). The module reads the calibration, runs the measurement and returns the
   temperature in milli-degrees Celsius (`dts_Temperature_mC_t`), so the application never sees the counts.
 - The measurement can be started by the software (once, `Dts_Set_MeasurementStart`), periodically by the module (`Dts_Set_PeriodicActive`, a period in ms) or by
-  a hardware trigger (a low-power timer output or an external signal). With the **quick** mode from the 32.768 kHz clock the sensor works in the
+  a hardware trigger (a low-power timer output or an external signal). With the 32.768 kHz clock (the LSE oscillator, which has to be ready before `Dts_Init`) the sensor works in the
   low-power modes and the threshold event wakes the MCU.
 - The module hides the differences between the families: the dedicated sensor against the ADC internal channel, the calibration data and
   their location, the reference clock and the trigger sources differ, the interface stays the same.
@@ -42,7 +45,7 @@ the ambient and dependent on the load), and it does not compensate other periphe
 
 | Item | Meaning |
 |---|---|
-| **Reference clock** | `DTS_CLK_SRC_PCLK` (a fast and accurate measurement while running) or `DTS_CLK_SRC_LSE` (the quick measurement in the low-power modes). |
+| **Reference clock** | `DTS_CLK_SRC_PCLK` (a fast and accurate measurement while running) or `DTS_CLK_SRC_LSE` (the measurement in the low-power modes, the LSE oscillator has to be ready). |
 | **Sampling time** | The number of the reference periods of the measurement; a longer time gives a finer resolution and a longer measurement. |
 | **Trigger** | `DTS_TRIGGER_SOFTWARE` or a hardware source (`DTS_TRIGGER_LPTIM1_OUT`, `DTS_TRIGGER_EXTI` ... - only the sources of the device). |
 | **Thresholds** | The low and the high threshold in milli-degrees; the events: temperature below the low, above the high. |
@@ -51,11 +54,12 @@ the ambient and dependent on the load), and it does not compensate other periphe
 Rules:
 
 1. `Dts_Init` reads the calibration (an error when it is missing or invalid - the temperature would be wrong), configures the clock, the
-   sampling time, the trigger and the thresholds and leaves the sensor idle. The calibration data live in the one-time-programmable / system memory
-   area of the device, which must not be read through the instruction cache: the module reads them through the Flash module (with the Cache module's
-   suspend where the family needs it).
+   sampling time, the trigger and the thresholds and leaves the sensor idle. On STM32H5 the calibration data are reset-value fields of the
+   DTS peripheral itself (loaded by hardware from the factory trim at every reset, RM0481/492/517), read directly with no Flash / OTP memory
+   location and no Cache module dependency; a family whose calibration does live in Flash / OTP documents that difference in its own branch.
 2. `Dts_Set_MeasurementStart` starts one measurement; the result is available when `Dts_Get_State` is `DTS_STATE_READY` or by the `MeasurementCallback`;
    `Dts_Get_Temperature( &temperature_mC )` returns the converted value. A read while a measurement is running returns an error.
+   The result is read once: the read returns the state to `DTS_STATE_IDLE` and the next `Dts_Set_MeasurementStart` is accepted.
 3. The periodic measurement uses the trigger of the configuration or the module's own timing in `Dts_Task`; each result raises the callback.
 4. The threshold events are reported by the `ThresholdCallback` with the direction (`DTS_THRESHOLD_LOW` / `DTS_THRESHOLD_HIGH`); the wake-up from the
    low-power mode works with the LSE reference only.
@@ -71,7 +75,7 @@ master.
 
 | Family | Branch | Sensor | Status |
 |---|---|---|---|
-| STM32H5 | `Dev/STM32H5` | `DTS`: software and four hardware triggers, programmable sampling time, the counter synchronized to the LSE or the PCLK, the low and the high temperature threshold with the interrupt, the asynchronous wake-up (LSE mode), the quick measurement from the LSE, factory calibration | planned (first) |
+| STM32H5 | `Dev/STM32H5` | `DTS`: software and four / five hardware triggers (LPTIM1/2/3 channel 1, EXTI13, PLAY1 output 13 on the lines that have PLAY1), programmable sampling time, the counter synchronized to the LSE or the PCLK, the low and the high temperature threshold with the synchronous and (LSE only) asynchronous interrupt and EXTI wake-up, factory calibration (read directly from the DTS_T0VALR1 / DTS_RAMPVALR reset-value registers, no Flash / Cache dependency - see Dts.c) | **implemented** |
 | STM32U5 | `Dev/STM32U5` | device dependent (the internal temperature channel of the `Adc` module on the lines without the sensor) | planned |
 | STM32H7 | `Dev/STM32H7` | `DTS` on the lines that have it | planned |
 | STM32U3 | `Dev/STM32U3` | device dependent | planned |
@@ -152,7 +156,7 @@ dtsConfig.ClkSrc = DTS_CLK_SRC_LSE;
 (void)Dts_Init( &dtsConfig );
 (void)Dts_Set_Thresholds( -10000, 85000 );                /* -10 ... 85 degrees Celsius */
 (void)Dts_Set_ThresholdIrqActive();
-(void)Dts_Set_PeriodicActive( 1000u );                    /* the quick LSE measurement every second */
+(void)Dts_Set_PeriodicActive( 1000u );                    /* the LSE measurement every second */
 ```
 
 ---
@@ -173,10 +177,13 @@ dtsConfig.ClkSrc = DTS_CLK_SRC_LSE;
 ## Dependencies
 
 - **Rcc** - peripheral clock, the LSE / PCLK reference, reset
-- **Flash** - the read of the factory calibration data (the Cache module suspends the instruction cache around it)
 - **Nvic** and **Exti** - interrupt and the wake-up line of the threshold
 - **LpTim** - an optional hardware trigger source
 - **RAL (Register Abstraction Layer)** - used internally to access the registers
+
+On STM32H5 the factory calibration is read directly from the DTS peripheral's own reset-value
+registers (see the Rules section above), so Flash and Cache are not dependencies of this
+family's implementation.
 
 All mandatory RCC, NVIC and EXTI configurations are handled internally.
 
